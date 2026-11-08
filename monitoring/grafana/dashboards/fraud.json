@@ -1,0 +1,122 @@
+{
+  "uid": "fraud-overview",
+  "title": "Fraud detection",
+  "tags": ["fraud"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Live model version",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(fraud_model_version)", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0, "unit": "none", "mappings": [] }, "overrides": [] },
+      "options": { "colorMode": "none", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Reviews waiting",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "postgres" },
+      "targets": [
+        { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+          "rawSql": "SELECT count(*) AS reviews FROM review_queue" }
+      ],
+      "options": { "colorMode": "none", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Unreadable messages (dead letters)",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(fraud_dead_letters_total) or vector(0)", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0, "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 } ] },
+        "color": { "mode": "thresholds" } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Decisions per second",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (decision) (rate(fraud_decisions_total[30s]))",
+          "legendFormat": "{{decision}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 30 } }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Time to decide, inside the service",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum by (le, source) (rate(fraud_scoring_seconds_bucket[30s])))",
+          "legendFormat": "p50 {{source}}" },
+        { "refId": "B", "expr": "histogram_quantile(0.99, sum by (le, source) (rate(fraud_scoring_seconds_bucket[30s])))",
+          "legendFormat": "p99 {{source}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Producer to decision (Kafka path)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(fraud_pipeline_seconds_bucket[30s])))",
+          "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.99, sum by (le) (rate(fraud_pipeline_seconds_bucket[30s])))",
+          "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Share of confirmed fraud that was caught, by day (chargebacks arrive late)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "postgres" },
+      "targets": [
+        { "refId": "A", "format": "table", "rawQuery": true, "editorMode": "code",
+          "rawSql": "SELECT day, model_version, decisions, confirmed_fraud, caught, recall_pct FROM cohort_recall ORDER BY day DESC, model_version LIMIT 60" }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [
+        { "matcher": { "id": "byName", "options": "recall_pct" },
+          "properties": [
+            { "id": "unit", "value": "percent" },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [
+              { "color": "red", "value": null }, { "color": "orange", "value": 70 }, { "color": "green", "value": 85 } ] } },
+            { "id": "custom.cellOptions", "value": { "type": "color-background" } }
+          ] }
+      ] }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Decisions per 10 s window (Flink)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "postgres" },
+      "targets": [
+        { "refId": "A", "format": "time_series", "rawQuery": true, "editorMode": "code",
+          "rawSql": "SELECT window_end AS time, decision AS metric, sum(n) AS value FROM decision_rate WHERE $__timeFilter(window_end) GROUP BY 1, 2 ORDER BY 1" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 30 } }, "overrides": [] }
+    }
+  ]
+}

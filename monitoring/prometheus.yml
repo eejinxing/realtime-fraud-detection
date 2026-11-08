@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:8000"]
+
+  # The worker service runs several replicas. DNS returns every one of them.
+  - job_name: worker
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9100

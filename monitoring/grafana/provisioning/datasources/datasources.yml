@@ -1,0 +1,23 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  # Credentials are the throwaway ones from compose.yaml, for local use only.
+  - name: Decisions DB
+    uid: postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: fraud
+    jsonData:
+      database: fraud
+      sslmode: disable
+      postgresVersion: 1700
+    secureJsonData:
+      password: fraud
