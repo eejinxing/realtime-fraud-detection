@@ -29,6 +29,8 @@ replay() {  # replay FROM_DAY TO_DAY: send that range through Kafka and wait for
 step() { echo; echo "=== $* ==="; }
 
 docker compose --profile '*' down -v --remove-orphans 2>&1 | tail -1
+# The images bake in the code. Rebuilding is quick when only code changed.
+docker compose --profile ops build ops 2>&1 | tail -1
 
 step "1. Train v1 (the model in production before merchant history existed)"
 ops python -m frauddetect.train 2>&1 | grep -E "labels already|low_and_slow|test_pr_auc|test_recall"

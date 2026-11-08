@@ -1,5 +1,6 @@
 import json
 import pickle
+from statistics import NormalDist
 
 import fakeredis
 import numpy as np
@@ -12,7 +13,9 @@ from frauddetect.features import FEATURE_NAMES, FeatureEngine, compute_features
 from frauddetect.merchant_risk import MerchantLookup, build_snapshots
 from frauddetect.mlops import (
     decide_promotion,
+    label_maturity_days,
     retrain_masks,
+    retrain_windows,
     run_retrain,
     train_challenger,
     win_probability,
@@ -22,6 +25,7 @@ from frauddetect.registry import list_versions, promote, read_pointer
 from frauddetect.scoring import Scorer, Transaction
 from frauddetect.simulator import simulate
 from frauddetect.store import RedisFeatureStore
+from frauddetect.train import labels_known_at
 
 INDEX = {name: i for i, name in enumerate(FEATURE_NAMES)}
 
@@ -94,14 +98,43 @@ def test_redis_serves_the_same_merchant_features_as_offline():
     assert risky_seen, "the check is meaningless if no merchant ever had confirmed fraud"
 
 
-def test_retrain_windows_are_ordered_and_leave_out_the_newest_week():
+def test_retrain_windows_are_ordered_and_stop_before_the_unconfirmed_days():
     df = pd.DataFrame({"ts": np.arange(0, 120, 0.5) * DAY})
-    masks = retrain_masks(df, 100, RetrainConfig(valid_days=5, holdout_days=7))
+    masks = retrain_masks(df, 100, RetrainConfig(valid_days=7, holdout_days=7), maturity_days=15)
     ts = df["ts"].to_numpy()
     assert ts[masks["train"]].max() < ts[masks["valid"]].min()
     assert ts[masks["valid"]].max() < ts[masks["holdout"]].min()
-    assert ts[masks["holdout"]].max() < 100 * DAY
+    assert ts[masks["holdout"]].max() < (100 - 15) * DAY
+    # The data has a point every half day, so a seven day window spans 6.5 days of points.
+    assert ts[masks["holdout"]].max() - ts[masks["holdout"]].min() >= 6.5 * DAY
     assert not any(masks["train"] & masks["holdout"])
+
+
+def test_chargeback_delay_is_measured_from_the_data_not_assumed():
+    """The simulator's true delay is known, so the measurement can be checked against it."""
+    sim = SimConfig(n_cards=600, attacks_per_day=4.0)
+    measured = label_maturity_days(simulate(sim), 112, 0.9)
+    truth = sim.label_delay_median_days * np.exp(NormalDist().inv_cdf(0.9) * sim.label_delay_sigma)
+    assert abs(measured - truth) < 1.5, (measured, truth)
+
+
+def test_too_little_history_to_measure_the_delay_is_an_error_not_a_guess():
+    with pytest.raises(ValueError, match="too few"):
+        label_maturity_days(merchant_df([(1, 1, 5.0)]), 112, 0.9)
+
+
+def test_the_matured_holdout_has_its_fraud_confirmed_and_the_old_one_did_not():
+    """This is why the first gate could never judge anything: its week was mostly unconfirmed."""
+    df = simulate(SimConfig(n_cards=600, attacks_per_day=4.0))
+    known = labels_known_at(df, 112 * DAY)
+
+    def confirmed_share(rcfg):
+        masks, _ = retrain_windows(df, 112, rcfg)
+        holdout = masks["holdout"]
+        return known[holdout].sum() / df["is_fraud"].to_numpy()[holdout].sum()
+
+    assert confirmed_share(RetrainConfig()) > 0.8
+    assert confirmed_share(RetrainConfig(valid_days=5, maturity_aware=False)) < 0.4
 
 
 def metrics(cost, pr_auc, frauds=60):

@@ -4,9 +4,11 @@
     python -m frauddetect.mlops promote v2
 
 A challenger is trained on the labels known on one day, then compared with the
-live model on the newest week, which neither was trained on. It goes live only
-if it clearly lowers the dollar cost without losing accuracy. The steps are
-separate functions so an orchestrator can run them as separate tasks.
+live model on a holdout week that neither was trained on. That week ends before
+today by the time chargebacks take to arrive, so that most of its fraud has been
+confirmed. It goes live only if it clearly lowers the dollar cost without losing
+accuracy. The steps are separate functions so an orchestrator can run them as
+separate tasks.
 """
 
 import argparse
@@ -38,16 +40,53 @@ from frauddetect.train import (
     train_candidate,
 )
 
+MIN_FRAUDS_TO_MEASURE_DELAY = 20
 
-def retrain_masks(df: pd.DataFrame, as_of_day: float, rcfg: RetrainConfig) -> dict[str, np.ndarray]:
+
+def label_maturity_days(df: pd.DataFrame, as_of_day: float, quantile: float) -> float:
+    """Days after a purchase by which `quantile` of its chargebacks have arrived.
+
+    Measured on the older half of the history only. A newer fraud may still be
+    waiting for its chargeback, so including it would make the delay look shorter
+    than it is. It fails loudly when there is too little history, because a guessed
+    delay would quietly move every window.
+    """
+    old = (
+        (df["is_fraud"] == 1)
+        & (df["ts"] < as_of_day * DAY / 2)
+        & (df["label_available_ts"] <= as_of_day * DAY)
+    )
+    delays = (df.loc[old, "label_available_ts"] - df.loc[old, "ts"]) / DAY
+    if len(delays) < MIN_FRAUDS_TO_MEASURE_DELAY:
+        raise ValueError(
+            f"only {len(delays)} old frauds with a chargeback, too few to measure how long they take"
+        )
+    return float(np.quantile(delays, quantile))
+
+
+def retrain_masks(
+    df: pd.DataFrame, as_of_day: float, rcfg: RetrainConfig, maturity_days: float = 0.0
+) -> dict[str, np.ndarray]:
+    """Train, validation and holdout rows. The windows end `maturity_days` before the day."""
     ts = df["ts"].to_numpy()
-    holdout_start = (as_of_day - rcfg.holdout_days) * DAY
-    valid_start = (as_of_day - rcfg.holdout_days - rcfg.valid_days) * DAY
+    end = as_of_day - maturity_days
+    holdout_start = end - rcfg.holdout_days
+    valid_start = holdout_start - rcfg.valid_days
     return {
-        "train": ts < valid_start,
-        "valid": (ts >= valid_start) & (ts < holdout_start),
-        "holdout": (ts >= holdout_start) & (ts < as_of_day * DAY),
+        "train": ts < valid_start * DAY,
+        "valid": (ts >= valid_start * DAY) & (ts < holdout_start * DAY),
+        "holdout": (ts >= holdout_start * DAY) & (ts < end * DAY),
     }
+
+
+def retrain_windows(
+    df: pd.DataFrame, as_of_day: float, rcfg: RetrainConfig
+) -> tuple[dict[str, np.ndarray], float]:
+    """The windows to use for a retrain on this day, and the chargeback delay behind them."""
+    maturity = (
+        label_maturity_days(df, as_of_day, rcfg.maturity_quantile) if rcfg.maturity_aware else 0.0
+    )
+    return retrain_masks(df, as_of_day, rcfg, maturity), maturity
 
 
 def load_dataset(cfg: PipelineConfig) -> tuple[pd.DataFrame, np.ndarray]:
@@ -75,7 +114,7 @@ def train_challenger(
     """Train a new model on labels known at `as_of_day` and save it. It is not live yet."""
     cfg, rcfg = cfg or PipelineConfig(), rcfg or RetrainConfig()
     df, X = load_dataset(cfg)
-    masks = retrain_masks(df, as_of_day, rcfg)
+    masks, maturity = retrain_windows(df, as_of_day, rcfg)
     y_known = labels_known_at(df, as_of_day * DAY)
 
     candidate = train_candidate(
@@ -88,6 +127,7 @@ def train_challenger(
         "train_rows": candidate.meta["train_rows"],
         "train_frauds": candidate.meta["train_frauds"],
         "valid_frauds": int(y_known[masks["valid"]].sum()),
+        "maturity_days": maturity,
     }
 
 
@@ -97,12 +137,12 @@ def holdout_result(
     cfg: PipelineConfig,
     rcfg: RetrainConfig,
 ) -> tuple[dict, np.ndarray]:
-    """One model on the newest week, using labels known at `as_of_day`.
+    """One model on the holdout week, using labels known at `as_of_day`.
 
     Returns its metrics and the dollar cost of each single decision.
     """
     df, X = load_dataset(cfg)
-    masks = retrain_masks(df, as_of_day, rcfg)
+    masks, maturity = retrain_windows(df, as_of_day, rcfg)
     y_known = labels_known_at(df, as_of_day * DAY)
 
     window = df[masks["holdout"]].reset_index(drop=True)
@@ -114,6 +154,9 @@ def holdout_result(
     metrics = evaluate(window, X_holdout, scores, bundle.policy, cfg.cost)
     metrics["holdout_rows"] = len(window)
     metrics["holdout_frauds"] = int(window["is_fraud"].sum())
+    metrics["holdout_to_day"] = as_of_day - maturity
+    metrics["holdout_from_day"] = as_of_day - maturity - rcfg.holdout_days
+    metrics["maturity_days"] = maturity
     decisions = decide_all(scores, X_holdout, bundle.policy)
     costs = row_costs(decisions, window["is_fraud"].to_numpy(), window["amount"].to_numpy(), cfg.cost)
     return metrics, costs
@@ -256,10 +299,12 @@ def run_retrain(
 def summarize(result: dict) -> str:
     champion, challenger = result["champion_metrics"], result["challenger_metrics"]
     verdict = "PROMOTED" if result["promote"] else f"KEPT {result['champion']}"
-    week = f"{champion['holdout_frauds']} confirmed frauds"
+    days = f"days {champion['holdout_from_day']:.0f} to {champion['holdout_to_day']:.0f}"
+    frauds = f"{champion['holdout_frauds']} confirmed frauds"
     cost = f"${champion['test_cost_with_model']:,.0f} against ${challenger['test_cost_with_model']:,.0f}"
     lines = [
-        f"Live {result['champion']} against challenger {result['challenger']}, newest week ({week})",
+        f"Live {result['champion']} against challenger {result['challenger']} on {days}, {frauds}",
+        f"  chargebacks take about {champion['maturity_days']:.0f} days, so later days are not judged yet",
         f"  dollar cost  {cost}",
         f"  PR-AUC       {champion['test_pr_auc']:.3f} against {challenger['test_pr_auc']:.3f}",
         f"  challenger cheaper in {result['win_probability']:.0%} of resampled weeks",

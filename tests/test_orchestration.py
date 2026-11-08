@@ -61,7 +61,7 @@ def test_trigger_stays_quiet_when_fraud_is_caught_or_data_is_thin():
     assert retrain_trigger(FakeConnection(None, [])) is None
 
 
-def test_retrain_job_runs_end_to_end_and_the_gate_keeps_the_live_model(scratch_run):
+def test_retrain_job_runs_end_to_end_and_the_live_model_follows_the_gate(scratch_run):
     from frauddetect.orchestration import retrain_job
 
     paths, _ = scratch_run
@@ -77,10 +77,10 @@ def test_retrain_job_runs_end_to_end_and_the_gate_keeps_the_live_model(scratch_r
     )
     assert result.success
     outcome = result.output_for_node("promote_step")
-    # With so little data the gate has too few frauds to trust, so v1 must stay live.
-    assert outcome["promoted"] is False
-    assert outcome["live"] == "v1" == read_pointer(paths)
-    assert "confirmed frauds" in outcome["reason"]
+    # Whatever the gate decided, the live model must be the one it said.
+    assert outcome["live"] == read_pointer(paths)
+    assert outcome["live"] == ("v2" if outcome["promoted"] else "v1")
+    assert outcome["reason"]
 
 
 def test_definitions_load_with_a_stopped_sensor():

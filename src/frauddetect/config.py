@@ -41,13 +41,22 @@ class SplitConfig:
 class RetrainConfig:
     """Windows for retraining on labels known at some day, counted back from that day.
 
-    The newest `holdout_days` are never trained on. They decide whether the new
-    model replaces the current one. Just before them sits the validation window
-    that picks thresholds, and everything older is training data.
+    A chargeback takes days to arrive, so the newest days hold almost no confirmed
+    fraud yet. Judging a model on them means judging it on a handful of cases. The
+    windows therefore stop short of today, at the day by which `maturity_quantile`
+    of chargebacks have arrived. That delay is measured from older data, not assumed.
+
+    Ending there come a holdout week that neither model trained on and that decides
+    whether the new model replaces the live one, a validation week before it that
+    picks thresholds, and everything older as training data.
     """
 
-    valid_days: float = 5
+    valid_days: float = 7
     holdout_days: float = 7
+    # False restores the first design, where the windows ended today. Only the audit
+    # uses it, to compare the two designs on the same data.
+    maturity_aware: bool = True
+    maturity_quantile: float = 0.9
     # Fraud is rare, so a week can hold very few cases. With fewer confirmed
     # frauds than this, a difference between two models is mostly luck.
     min_holdout_frauds: int = 30
