@@ -94,7 +94,7 @@ services:
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom
     ports:
       - "127.0.0.1:8000:8000"
-    restart: on-failure
+    restart: unless-stopped
     depends_on: &ready
       bootstrap:
         condition: service_completed_successfully
@@ -109,7 +109,7 @@ services:
   worker:
     <<: *app
     command: ["python", "-m", "frauddetect.stream", "worker"]
-    restart: on-failure
+    restart: unless-stopped
     deploy:
       replicas: 4 # one per Kafka partition; more would sit idle
     depends_on: *ready
@@ -117,7 +117,7 @@ services:
   sink:
     <<: *app
     command: ["python", "-m", "frauddetect.stream", "sink"]
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy

@@ -1,12 +1,12 @@
 # Real-time card fraud detection
 
-This project scores card transactions and returns one of three decisions: approve, review, or decline. I used a simulator to test what happens when a new type of fraud appears and the first chargebacks take days to arrive.
+This project scores card transactions and decides whether to approve them, send them for review, or decline them. I used a simulator to test what happens when a new type of fraud appears and the first chargebacks take days to arrive.
 
 Transactions can come in through FastAPI or Kafka. Both paths use the same card features and ONNX model. Redis holds card history across processes, and a Kafka consumer writes decisions and chargebacks to PostgreSQL. Everything runs locally with Docker Compose.
 
 ## Run it locally
 
-Use Docker with Compose v2. Run these commands from the repository root. The shell scripts use Bash, so on Windows run them in WSL.
+Use Docker with Compose v2. Run these commands from the repository root. On Windows, run the Bash scripts in WSL and keep a WSL terminal open if Docker Engine runs inside it.
 
 ```bash
 docker compose --profile ops run --rm --build ops
