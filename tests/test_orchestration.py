@@ -1,7 +1,7 @@
 import pytest
 
 from frauddetect.config import DAY
-from frauddetect.monitor import retrain_trigger
+from frauddetect.monitor import build_report, retrain_trigger
 from frauddetect.registry import read_pointer
 
 dagster = pytest.importorskip("dagster")
@@ -22,6 +22,7 @@ class FakeCursor:
     def __init__(self, connection):
         self.connection = connection
         self.sql = ""
+        self.params = None
 
     def __enter__(self):
         return self
@@ -31,12 +32,16 @@ class FakeCursor:
 
     def execute(self, sql, params=None):
         self.sql = sql
+        self.params = params
 
     def fetchone(self):
         return (self.connection.newest_ts,)
 
     def fetchall(self):
-        return self.connection.cohort_rows
+        if "FROM cohort_recall" in self.sql:
+            since_day, until_day = self.params
+            return [row for row in self.connection.cohort_rows if since_day <= row[0] < until_day]
+        return []
 
 
 def test_trigger_fires_when_confirmed_fraud_is_being_missed():
@@ -59,6 +64,15 @@ def test_trigger_stays_quiet_when_fraud_is_caught_or_data_is_thin():
     thin = [(100, "v1", 3000, 3, 0)]
     assert retrain_trigger(FakeConnection(111.5 * DAY, thin)) is None
     assert retrain_trigger(FakeConnection(None, [])) is None
+
+
+def test_monitor_report_excludes_cohorts_at_and_after_the_end_day(trained_run):
+    paths, _, _ = trained_run
+    rows = [(99, "v1", 100, 5, 0), (100, "v1", 100, 7, 6), (101, "v1", 100, 8, 0)]
+    report = build_report(FakeConnection(101.5 * DAY, rows), paths, 100, 101)
+    assert report["recall"]["confirmed_fraud"] == 7
+    assert report["recall"]["caught"] == 6
+    assert [row["day"] for row in report["cohorts"]] == [100]
 
 
 def test_retrain_job_runs_end_to_end_and_the_live_model_follows_the_gate(scratch_run):

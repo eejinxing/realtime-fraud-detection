@@ -1,275 +1,85 @@
-# 实时信用卡欺诈检测系统
+# Real-time card fraud detection
 
-按真实风控系统的结构搭建的欺诈检测项目：交易事件进入 Kafka，用 Redis 里的卡片状态实时算行为特征，模型打分，再由成本策略和硬规则给出批准、人工复核或拒绝。决策写入 PostgreSQL，拒付（chargeback）几天后回流，系统据此监控漏报、重训模型，并用门槛决定新模型能不能上线。
+This project scores card transactions and returns one of three decisions: approve, review, or decline. I used a simulator to test what happens when a new type of fraud appears and the first chargebacks take days to arrive.
 
-**全部工具免费，全部在本地运行**，不需要云账号，也不需要付费 API。
+Transactions can come in through FastAPI or Kafka. Both paths use the same card features and ONNX model. Redis holds card history across processes, and a Kafka consumer writes decisions and chargebacks to PostgreSQL. Everything runs locally with Docker Compose.
 
-## 当前进度：阶段三已完成
+## Run it locally
 
-```
- 调用方 → FastAPI（同步，4 进程）─┐
-                                  ├─ Redis 卡片状态 + 商户历史 → ONNX 打分 → 规则 → 决策
- 模拟器 → Kafka: transactions ────┘   worker ×4                                    │
-              │                                                                      ▼
-              └─ 坏消息 → transactions.dlq        Kafka: decisions ─┬─ sink → PostgreSQL ─┬─ Grafana
-                                                                    │                      │
- 拒付（几天后到）→ Kafka: labels ──────────────── sink ─────────────┘                      ├─ 监控：漏报召回率、PSI
-                                                                    └─ Flink SQL：10 秒窗口计数 ─┘
- Prometheus 抓取 API 和 worker 的指标 ─→ Grafana
-
- Dagster：检查漏报 → 训练挑战者 → 对比线上模型 → 门槛 → 晋升
- 模型注册表：artifacts/models/vN + current.json，运行中的服务自动切换，回滚是同一个操作
-```
-
-## 运行
-
-先装 Docker（开源免费，会询问一次 sudo 密码）：
+Use Docker with Compose v2. Run these commands from the repository root. The shell scripts use Bash, so on Windows run them in WSL.
 
 ```bash
-bash scripts/setup_wsl_docker.sh
+docker compose --profile ops run --rm --build ops
+docker compose up --build --wait api worker sink
+curl --fail http://localhost:8000/health
 ```
 
-以下命令都在 WSL 里、项目目录下运行。WSL 空闲时会自动关机，所以运行期间要保持一个 WSL 终端开着。
+The first command generates the dataset, trains XGBoost and exports the baseline as `v1`. It resets the local model registry, so use the retraining command below if you want to keep previous versions.
 
-训练 v1（在容器里，第一次要构建约 2.5GB 的镜像）：
+Open [the API docs](http://localhost:8000/docs) to try `POST /v1/score`, or publish the first 3,000 simulated transactions through Kafka.
 
 ```bash
-docker compose --profile ops run --rm ops
+docker compose run --rm -T producer python -m frauddetect.stream produce --n 3000 --rate 200
+docker compose exec -T postgres psql -U fraud -d fraud -c 'SELECT decision, count(*) FROM decisions GROUP BY decision;'
 ```
 
-启动核心服务：
+Use a fresh stack for `bash scripts/smoke.sh` after training `v1`. The script removes this Compose project's volumes, replays 3,000 transactions, and checks both the PostgreSQL row count and the scores against the offline baseline.
+
+## Chargebacks and retraining
+
+`scripts/stage3_demo.sh` trains a baseline, replays traffic, releases chargebacks, and demonstrates promotion and rollback. It resets this Compose project's volumes and model registry. On an already-running stack with traffic replayed through day 111, use the commands below to run the chargeback and retraining steps on their own.
 
 ```bash
-docker compose up -d --build api worker sink
+docker compose run --rm -T producer python -m frauddetect.stream labels --as-of-day 112
+docker compose --profile ops run --rm -T ops python -m frauddetect.monitor report --since-day 100 --until-day 112 --text
+docker compose --profile ops run --rm -T ops python -m frauddetect.mlops retrain --as-of-day 112 --text
 ```
 
-按需启动其余部分（内存有限，建议分批开）：
+The sink consumes chargebacks asynchronously. Wait for the labels to reach PostgreSQL before reading the report. Day numbers start at the beginning of the simulation, and the report's end day is exclusive.
+
+The promotion gate compares the challenger and the live model on a week with mostly settled chargebacks. It requires at least 30 confirmed frauds, a cost reduction of at least 5%, a lower cost in at least 90% of resamples, and a PR-AUC drop no greater than 0.02. Running scorers pick up promotions and rollbacks from `artifacts/current.json`.
+
+### Optional services
+
+| Service | Start command | Local address |
+| --- | --- | --- |
+| Grafana and Prometheus | `docker compose --profile monitoring up -d grafana prometheus` | [Grafana](http://localhost:3001), [Prometheus](http://localhost:9090) |
+| Dagster | `docker compose --profile orchestration up -d dagster` | [Dagster](http://localhost:3000) |
+| Flink | `docker compose --profile flink up -d flink-jobmanager flink-taskmanager` | [Flink](http://localhost:8081) |
+
+Once the Flink cluster has an available task slot, submit the SQL job with `docker compose --profile flink run --rm flink-submit`. It writes decision counts in 10-second processing-time windows to PostgreSQL. Dagster runs the retraining workflow and leaves the automatic retraining sensor stopped by default.
+
+## What the simulation showed
+
+| Baseline v1, default-seed Docker run | Result |
+| --- | ---: |
+| PR-AUC, chronological split | 0.756 |
+| PR-AUC, random split | 0.966 |
+| Recall, review and decline combined | 74.9% |
+| Precision, review and decline combined | 33.1% |
+| Precision of the review queue | 0.9% |
+| Recall for the new `low_and_slow` pattern | 0% |
+
+The random split mixed transactions from before and after the new fraud pattern. The chronological split gives a better picture of what happened at deployment. In the day-112 replay, 50 of 67 confirmed frauds were flagged. The eight monitored distributions stayed below the PSI warning threshold, and the promotion gate kept `v1` because the challenger cost more on the holdout.
+
+The simulator makes account takeover and card testing easier to catch than they would be with real data. The new pattern is still a blind spot. Moving the holdout back far enough for labels to settle also moves training further into the past. The [audit](AUDIT.md) has the counts, the seed comparisons, and the limits of both findings.
+
+## What is still open
+
+- API tail latency varied at 200 requests per second in earlier WSL runs. The current delivery code needs a fresh benchmark before using the old streaming figures as a reference.
+- Card features assume transactions arrive in timestamp order for each card. Redis protects concurrent writes, and the cached features for a transaction ID expire after one day.
+- Kafka workers wait for output acknowledgements before recording offsets. Direct API requests queue their Kafka event without waiting for the broker. PostgreSQL keeps the first decision for a transaction ID.
+- The stack is a local simulation. Dagster runs in development mode and the labels come from generated chargebacks.
+- Kubernetes packaging and an analyst-facing workflow are still open.
+
+## Tests
+
+Use Python 3.12 in a virtual environment and run the following from the repository root.
 
 ```bash
-docker compose --profile monitoring up -d prometheus grafana
+python -m pip install -e ".[train,ops,dev]"
+python -m ruff check .
+python -m pytest
 ```
 
-```bash
-docker compose --profile orchestration up -d dagster
-```
-
-```bash
-docker compose --profile flink up -d flink-jobmanager flink-taskmanager
-```
-
-```bash
-docker compose --profile flink run --rm flink-submit
-```
-
-| 界面 | 地址 |
-|---|---|
-| Grafana（仪表盘已预置） | http://localhost:3001 |
-| Prometheus | http://localhost:9090 |
-| Dagster | http://localhost:3000 |
-| Flink | http://localhost:8081 |
-
-脚本（**都会清空本项目的本地数据**，除非特别说明）：
-
-| 脚本 | 做什么 | 耗时 |
-|---|---|---|
-| `scripts/stage3_demo.sh` | 完整的阶段三故事：训练、回放、拒付回流、监控、重训、切换、回滚 | 约 10 分钟 |
-| `scripts/stage3_verify.sh` | 在演示留下的数据上验证 Dagster、Flink、Grafana（**保留数据**） | 约 5 分钟 |
-| `scripts/smoke.sh` | 快速验证核心链路 | 约 3 分钟 |
-| `scripts/monitoring_check.sh` | 验证 Prometheus 和仪表盘每个面板的查询 | 约 3 分钟 |
-| `scripts/flink_check.sh` | 单独验证 Flink 任务的计数 | 约 2 分钟 |
-| `scripts/benchmark.sh` | 阶段二的延迟和故障接管基准 | 约 6 分钟 |
-| `scripts/rebuild.sh` | 改代码后重建服务镜像（几秒） | 几秒 |
-
-镜像把代码打包在里面，**改了代码要重建镜像，否则容器跑的是旧代码**。上面的检查脚本启动时都带了 `--build`。
-
-单元测试（Windows 或 WSL 都行）：
-
-```bash
-py -3.12 -m venv .venv
-```
-
-```bash
-.venv\Scripts\python.exe -m pip install -e ".[train,ops,dev]"
-```
-
-```bash
-.venv\Scripts\python.exe -m pytest
-```
-
-用完释放内存（保留数据）：
-
-```bash
-docker compose --profile '*' down
-```
-
-## 阶段三演示结果
-
-由 `scripts/stage3_demo.sh` 产生，**同一份代码跑了两次，数字逐位相同**。数据是模拟的，36.4 万笔交易，欺诈率 0.46%。
-
-| 步骤 | 结果 |
-|---|---|
-| 回放第 100–112 天（v1 在线） | 发出 36,175 笔，存下 36,175 笔，零丢失 |
-| 第 112 天为止到达的拒付 | 67 笔 |
-| **漏报监控** | 已确认欺诈 67，抓到 50，**召回率 74.6%，告警** |
-| **输入漂移（PSI）** | 8 项**全部"稳定"**，最大是商户欺诈率 0.059 |
-| 重训，在已成熟的第 90–97 天上比较（147 个已确认欺诈，拒付约 15 天到） | 成本 $700（v1）对 $835（v2），PR-AUC 0.944 对 0.957 |
-| **晋升门槛** | **保留 v1**：v2 的成本反而高 19%，只有 1% 的重抽样里更便宜 |
-| 用真实答案检验之后几天（仅模拟用） | v1 成本 **$1,268**，v2 成本 **$1,306**；两个模型对新型欺诈都是 0% |
-| 手动切到 v2，再回滚 | 第 112 天 3,015 笔全用 v2，第 113 天 2,954 笔全用 v1，**服务没有重启** |
-| Dagster 任务跑在真实数据库上 | 成功：训练 v3（只做 3 次调参试验），成本几乎没变（0.0%），门槛保留 v1 |
-| 传感器 | 在真实数据上正确触发（62 个已确认欺诈里抓到 46 个，召回率 74.2%，请求按第 113 天的标签重训） |
-| Flink | 回放 3,024 笔，PostgreSQL 存 3,024 笔，Flink 数出 3,024 笔 |
-| Prometheus 和 Grafana | API 1/1、worker 4/4 在线；8 个面板的查询全部通过；worker 计数 15,000 对发出的 15,000 |
-
-### 从结果看到的事
-
-**1. 输入监控看不见这种漂移，漏报监控看得见。** 新型欺诈 `low_and_slow` 用持卡人自己的设备、正常金额、本地位置，只是落在被攻破的商户上，所以我监控的 7 个输入和模型得分的分布都没变，PSI 一片绿。只有拒付回来之后统计"已确认的欺诈抓到了多少"，才发现 74.6%。代价是**有延迟**：演示里第 108–111 天已确认欺诈是 0，不是没有欺诈，是拒付还没到。
-
-**2. 重训没有解决问题，新模型的好坏不稳定。** 这是负面结果，不是实现问题。下面是**第一版窗口设计**下的结果：默认种子上新模型更差；在另外 4 个种子上，2 个更好（成本低 8–12%）、2 个更差（成本高 13–16%），见 [AUDIT.md](AUDIT.md)。窗口改过之后的结果在下一条和 AUDIT.md 第七节。第一版在默认种子上的细节：
-
-- 模拟里 `low_and_slow` 一共只有 61 笔。商户历史特征对它的区分力（AUC）在第 100–112 天只有 0.63，到第 112–120 天才升到 0.89，因为拒付平均要 7 天才到。
-- 第 100 天之前的训练数据里，"商户 14 天内已确认欺诈 ≥ 2"的行只有 485 行，其中真欺诈 7 行。模型没得学。
-- （第一版窗口）v2 在第 11 棵树就停止训练（v1 是 106 棵），拒绝阈值 0.89（v1 是 0.09）。它们是在一个只有 43 个已确认欺诈的 5 天验证窗口上调参和定阈值的。**我怀疑窗口太小是主因，没有验证。**
-- 两个模型对 `low_and_slow` 的召回率之后几天都是 0%。
-
-**3. 晋升门槛：第一版几乎没用。修改后能判断了，但我不能说它比"永远保留现有模型"更有价值。**
-
-第一版的病根是窗口设计：留出窗口取最近 7 天，而拒付要几天才到，窗口里大部分欺诈还没被标记。在 4 个种子上留出窗口只有 8–13 个已确认欺诈，门槛 4 次都直接拒绝，没有真正比较。其中"至少 30 个欺诈"这个下限，是我看过默认种子的未来结果之后才定的。
-
-修改后：留出窗口**只取已成熟的日期**，拒付要几天到是**从数据里测出来的**（默认种子上约 15 天），验证窗口和留出窗口各一周。在从没用过的种子 21–24 上只跑了一次：留出窗口有 103–111 个已确认欺诈（第一版是 11–16 个），决定和之后的真实成本一致 4/4（第一版 1/4）。**但**这 4 个里挑战者本来就有 3 个更差，"永远保留"也能对 3/4；新门槛多对的那 1 次，晋升的模型之后只比 v1 便宜 $5。
-
-**一个没解决的矛盾：** 第一版窗口训练出的挑战者之后平均成本是 $1,466，新窗口的是 $1,630，v1 是 $1,522。要判断得准，就得把窗口挪到已成熟的旧日期，训练数据也只能停在更早，用不上最近的数据，模型反而变差。常见做法是通过门槛后用全部数据重新训练一次再上线，这里没做。详见 [AUDIT.md](AUDIT.md) 第七节。
-
-**4. 传感器的第一版有设计缺陷，已修。** 它只看最近 7 天，而拒付要 7 天才到，那段时间几乎没有已确认欺诈，样本不足就不告警，同一时刻监控报告却是告警状态。现在只评判至少 7 天前的日期（回看 21 天）。
-
-## 可信度审计
-
-完整报告在 [AUDIT.md](AUDIT.md)，包括偷看答案、过拟合与欠拟合、精确率与召回率、说错的地方。要点：
-
-- **没有发现数据泄漏**，4 个永久测试守着（`tests/test_leakage.py`），测试本身用故意植入的泄漏验证过。
-- **但模拟器是我写的，我知道答案**，所以"已知欺诈 100% 抓到"反映的是一个很容易的题，不是真实世界的水平。
-- **没有明显过拟合或欠拟合**。验证到测试的落差完全来自新型欺诈（去掉后测试期 PR-AUC 是 0.997）。深度 2 的简单模型和调参后的一样好，**调参在这份数据上没价值**。
-- **精确率 33.1%，召回率 74.9%**，漏掉的 100% 是新型欺诈。拒绝层精确率 92%，**复核层只有 0.9%**。阈值对未来偏乐观。
-- **晋升门槛**窗口设计修过一次（见上）。在 4 个新种子上能判断了，但样本只有 4 个，证明不了它比"永远保留现有模型"更有价值。它判断用的是已成熟的旧日期，所以对最新的欺诈没有判断力。
-- 找到并改正了 10 处说得比证据更肯定的地方。
-
-## 阶段二结果
-
-所有服务都跑在同一台笔记本（16 线程、WSL 分配约 8GB 内存）上。
-
-| 测试 | 结果 |
-|---|---|
-| 正确性：5.6 万笔走完 Kafka → Redis → PostgreSQL | 零丢失，和离线分数最大差异 2.38e-07 |
-| 故障接管：处理中强杀 1 个 worker | 零丢失，分数不变；受影响消息的最长延迟 8.1 秒（消费者会话超时设为 6 秒，接管时间没有单独测量） |
-| Kafka 链路，500 笔/秒（两次测量） | P50 约 50 ms，P99 500–790 ms |
-| Kafka 链路，1000 笔/秒（两次测量） | **超过容量**，积压到 P50 约 2 秒 |
-| 同步 API，100 请求/秒（只测了一次） | P50 约 4 ms，**P99 19 ms，达到 50 ms 目标**；不带 Kafka 发布时 10 ms（也只测了一次） |
-| 同步 API，200 请求/秒（多次测量） | P50 约 4 ms，**P99 在 28–500 ms 之间波动，未达标** |
-
-Kafka 链路的延迟从生产者发出算起，到 worker 做出决策为止。
-
-### 模型（阶段一）
-
-| 指标 | 结果 |
-|---|---|
-| PR-AUC，随机切分（常见的错误做法） | 0.966 |
-| **PR-AUC，按时间切分（真实情况）** | **0.751**（Windows 训练）/ 0.756（Docker 训练） |
-| 召回率 / 精确率 | 74.9% / 27.8%（Windows 训练）；74.9% / 33.1%（Docker 训练） |
-| 测试期成本：无模型 → 有模型 | $27,332 → $4,047（节省 85.2%），Windows 训练 |
-
-同样的模型，随机切分的 PR-AUC 是 0.966，按时间切分是 0.751。我认为原因是随机切分让模型提前看到了未来才出现的欺诈模式：把新型欺诈去掉之后，按时间切分的 PR-AUC 是 0.997（见 [AUDIT.md](AUDIT.md)）。
-
-两个训练环境（Windows 和 Docker）得到 0.751 和 0.756，**库版本完全相同，我不知道为什么不同**；同一环境内重跑结果逐位相同。
-
-### 性能调优记录
-
-第一次跑通时，Kafka 链路的 P50 是 10.9 秒。排查过程：
-
-| 假设 | 做法 | 结论 |
-|---|---|---|
-| 单个 worker 太慢 | 分段计时，Redis 占 90%；减少往返，扩到 4 个 worker | 有帮助，但不够 |
-| 同步提交 offset 拖慢 Kafka | 改成每秒提交一次 | Kafka CPU 降了，但 P99 反而升到 1.4 秒，真正的问题是阻塞等待 |
-| 主循环不该等待 | 投递成功后回调记录 offset，后台自动提交 | 保留，这是标准的"至少一次"写法 |
-| Kafka 空转 | 看 Broker 每个线程的 CPU | **`C2_CompilerThread` 排第一：是 JVM 还没预热**，也是之前数字不稳定的主因 |
-| P99 的 500 ms 来自 `fetch.wait.max.ms` | 调到 100 ms | 没有改善，已撤销 |
-
-最大的教训：**之前的基准测试是在冷启动的 JVM 上做的，数字本身就不可信。** 现在基准测试先跑 2 万笔预热，不计入成绩。
-
-### 同步 API 在 200 请求/秒下的尾部延迟（没有解决）
-
-P50 稳定在 4 ms，但 P99 忽高忽低。逐项排查，脚本在 `scripts/experiments/`：
-
-| 怀疑的原因 | 实验 | 结论 |
-|---|---|---|
-| 发布到 Kafka 拖慢 | 对比带 / 不带 Kafka 发布的 API | **排除** |
-| 运行环境整体抖动 | 同样速率压一个什么都不做的 `/health` | **排除**，P99 稳定 3 ms |
-| Redis 磁盘持久化（AOF） | 开关 AOF，并用 Redis 延迟监控 | **排除** |
-| 锁冲突和重试 | 给慢请求记录重试次数 | **基本排除，但没有完整统计**：抽样看到的 14 条慢调用都只试了 1 次，另一次日志里见过 2 次 |
-| 切换 uvicorn 到 uvloop | 换掉后重测 | P50 从 9–13 ms 降到约 4 ms，有效，但 P99 没稳定 |
-| Python 线程切换（GIL） | 切换间隔从 5 ms 降到 0.2 ms | **不确定**：有改善但不稳定，没有保留 |
-
-慢请求的时间花在 Redis 特征库的任意一次网络往返上，随机停顿 5–50 ms。根因没找到。下一步可以试：用 Lua 脚本把读改写合成一次往返、限定 API 容器的 CPU 核数、在原生 Linux 上复测排除 WSL 的影响。慢请求日志默认开启，可用环境变量 `FRAUD_SLOW_MS` 和 `FRAUD_SLOW_STORE_MS` 调整。
-
-## 关键设计
-
-- **训练和线上用同一份特征代码**（`features.py`），测试保证线上分数等于离线分数，**包括商户历史**（`test_redis_serves_the_same_merchant_features_as_offline`）。
-- **时间点正确**：特征只用当前交易之前的信息，标签只用当时已经到达的拒付。商户历史按"每天开始时的快照"计算，只数当时已到的拒付，线上线下一致。
-- **同一张卡的事件按序处理**：Kafka 消息按 `card_id` 分区。
-- **至少一次投递 + 幂等**：决策确认送达后才记录 offset。重复投递时 Redis 返回当初的特征，PostgreSQL 靠主键去重。
-- **并发安全**：多进程改同一张卡时用 Redis 的 WATCH/MULTI 乐观锁。
-- **坏消息不拖垮系统**：格式错误的消息进入死信队列，不丢失，也不卡住 worker。
-- **阈值由美元成本决定**：拒绝要求 90% 精确率，复核阈值取总成本最低的点。
-- **规则和模型分开**：规则只能让决策更严格，不用重训就能应对新攻击。
-- **模型版本化**：`artifacts/models/vN` 加一个指针文件。晋升和回滚都是原子地改指针，运行中的服务每 2 秒检查一次，加载失败就继续用旧模型。
-- **晋升门槛**：新模型必须在**已成熟的一周**（拒付大部分已到、没训练过的数据）上同时满足：已确认欺诈不少于 30 个、成本至少降 5%、在至少 90% 的重抽样中更便宜、PR-AUC 下降不超过 0.02。任何一项不满足就保留现有模型。
-- **两种监控分开**：PSI 不需要标签、马上有结果，但看不见"长得像正常消费"的欺诈；漏报召回率看得见，但要等拒付。
-- **传感器默认关闭**：自动启动重训是运营者的决定。它只评判至少 7 天前的日期。
-
-## 已知限制
-
-**模型与数据**
-
-- 模拟里的新型欺诈很小（61 笔），重训**没能学会它**（见上文）。我没有为了让结果好看去调模拟参数。要验证"拒付足够多时重训能不能恢复"，需要一个更大的欺诈活动场景，这还没做。
-- 验证窗口太小导致 v2 欠拟合的判断**没有验证**。可以试：更长的验证窗口，或交叉验证。
-- 重训时最新约 29 天（拒付延迟约 15 天，加验证一周、留出一周）不参与训练，而新型欺诈的数据恰恰集中在那里。这是个取舍，实测让挑战者变差了。常见做法是通过门槛后用全部数据重新拟合一次，这里没做。
-- 自助法对"时间推移后分布变了"无能为力。
-- 已知欺诈模式的召回率偏高，说明模拟数据偏简单。
-
-**系统**
-
-- 同步 API 在 200 请求/秒下 P99 不稳定，100 请求/秒下达标。根因未找到。
-- Kafka 链路在 500 笔/秒下 P99 仍有几百毫秒，1000 笔/秒超过单机容量。两种负载各只测了两次，瓶颈在哪一环没有单独查。
-- 投递失败时 worker 会主动崩溃并重放。如果后面的消息已先送达，它的 offset 可能先被提交，极端情况下可能漏掉一笔，没有测试覆盖。
-- 拒付由模拟器按到达时间释放，生产环境来自卡组织。
-- 日期的"今天"取自数据库里最新的一笔决策，因为模拟比真实时间快得多。
-- Flink 窗口用处理时间（决策到达的时间），不是交易时间，因为模拟的交易时间远远快于时钟。
-- Dagster 用开发模式（`dagster dev`）运行，适合本地，不适合生产。
-- **没有测过所有组件同时运行时的内存占用**，WSL 约 8GB，建议分批启动。
-- k6 用假交易写真实的卡，跑完后状态不再能和离线分数对比，需要重置。
-- GitHub Actions 配置（`.github/workflows/ci.yml`）还没有实际运行过。
-
-## 与原计划的差别
-
-| 原计划 | 实际 | 原因 |
-|---|---|---|
-| Airflow 或 Dagster | Dagster | **我没有试过 Airflow。** 选 Dagster 是因为它更轻、直接用 Python 函数。"Airflow 的依赖会和 XGBoost、pandas 冲突"只是我的预判，**没有验证** |
-| Evidently 做漂移监控 | 自己实现 PSI | **我没有试过 Evidently。** 自己实现 PSI 的好处是透明、可测试。"Evidently 接口变化大、依赖重"是我的印象，**没有验证** |
-
-## 免费路线
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| 1 | 基线、时间切分、服务 | 已完成 |
-| 2 | 事件流和在线特征：Kafka、Redis、PostgreSQL、k6 | 已完成 |
-| 3 | 持续运营：Flink、Dagster、Prometheus、Grafana、拒付回流、重训门槛 | 已完成 |
-| 4 | 本地 Kubernetes（kind、Helm）和分析师助手（Ollama） | 未开始 |
-
-### 分析师助手用哪个模型
-
-我查到的多数来源说 DeepSeek 只有网页聊天免费、API 按 token 收费（有一个来源提到有免费额度，我没有核实到官方页面）。所以这里用 Ollama 在本机跑模型，不花钱，交易数据也不会离开电脑。可以用已安装的 `qwen3:4b`，想用 DeepSeek 就拉它的开源权重：
-
-```bash
-ollama pull deepseek-r1:1.5b
-```
-
-大模型只用来给分析师写案件摘要，不参与实时打分，因为它慢、输出不稳定，也不便于审计。
+Stop the stack with `docker compose --profile '*' down`. This keeps the named volumes. Add `-v` only when you want to reset them.

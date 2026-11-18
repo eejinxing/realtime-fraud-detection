@@ -43,8 +43,7 @@ WHERE decision = 'review'
 ORDER BY score DESC;
 
 -- How much of the confirmed fraud each day's decisions let through.
--- Recall is measured among confirmed fraud only, so late chargebacks do not
--- bias it: a fraud that is confirmed later is still caught or missed the same way.
+-- This is recall among confirmed chargebacks. Recent cohorts can be incomplete.
 CREATE VIEW cohort_recall AS
 SELECT
     floor(d.event_ts / 86400)::int AS day,

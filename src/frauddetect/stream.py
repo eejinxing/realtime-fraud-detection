@@ -25,7 +25,7 @@ import redis
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 from psycopg.types.json import Jsonb
-from pydantic import ValidationError
+from pydantic import Field, FiniteFloat, ValidationError
 
 from frauddetect import metrics
 from frauddetect.config import DAY, Paths, SplitConfig
@@ -42,6 +42,7 @@ DEAD_LETTER = "transactions.dlq"
 N_PARTITIONS = 4
 BATCH_SIZE = 500
 POLL_SECONDS = 0.02
+DELIVERY_WAIT_SECONDS = 10
 
 INSERT_DECISION = """
     INSERT INTO decisions
@@ -70,24 +71,30 @@ def decision_event(txn: Transaction, result: Decision, produced_at: float | None
     }
 
 
-def handle_transaction(scorer: Scorer, raw: bytes) -> tuple[str, str | None, bytes]:
+class StreamTransaction(Transaction):
+    produced_at: FiniteFloat | None = Field(default=None, exclude=True)
+
+
+def handle_transaction(scorer: Scorer, raw: bytes | None) -> tuple[str, str | None, bytes]:
     """Return the topic, key and value to publish for one incoming message.
 
     A malformed message goes to a dead-letter topic. It must not stop the
     worker, and it must not be dropped silently either.
     """
     try:
-        payload = json.loads(raw)
-        txn = Transaction.model_validate(payload)
-    except (ValueError, ValidationError) as error:
+        txn = StreamTransaction.model_validate_json(raw)
+    except ValidationError as error:
         metrics.DEAD_LETTERS.inc()
-        body = {"error": str(error)[:500], "raw": raw.decode("utf-8", "replace")}
+        body = {
+            "error": str(error)[:500],
+            "raw": raw.decode("utf-8", "replace") if raw is not None else None,
+        }
         return DEAD_LETTER, None, json.dumps(body).encode()
 
     started = time.perf_counter()
     result = scorer.score(txn)
     metrics.record_decision(result, "worker", time.perf_counter() - started)
-    produced_at = payload.get("produced_at")
+    produced_at = txn.produced_at
     if produced_at:
         metrics.PIPELINE_SECONDS.observe(max(time.time() - produced_at, 0.0))
     event = decision_event(txn, result, produced_at)
@@ -163,37 +170,50 @@ def publish(
             producer.poll(0.1)
 
 
+class DeliveryAcks:
+    def __init__(self) -> None:
+        self.error = None
+
+    def record(self, error, _message) -> None:
+        if error is not None and self.error is None:
+            self.error = error
+
+    def wait(self, producer: Producer) -> None:
+        pending = producer.flush(DELIVERY_WAIT_SECONDS)
+        if self.error is not None:
+            raise RuntimeError(f"Kafka delivery failed: {self.error}")
+        if pending:
+            raise RuntimeError(f"Timed out waiting for delivery of {pending} Kafka records")
+
+
+def process_transactions(scorer: Scorer, consumer: Consumer, producer: Producer, messages) -> None:
+    acks = DeliveryAcks()
+    last_messages = {}
+    for message in messages:
+        result = handle_transaction(scorer, message.value())
+        publish(producer, *result, on_delivery=acks.record)
+        last_messages[message.topic(), message.partition()] = message
+
+    # Decisions and dead letters go to different topics. A later record can
+    # be acknowledged first, so commit progress only after the entire batch.
+    acks.wait(producer)
+    for message in last_messages.values():
+        consumer.store_offsets(message=message)
+
+
 def run_worker() -> None:
     artifact_dir = Path(os.environ.get("FRAUD_ARTIFACT_DIR", Paths().artifact_dir))
     scorer = Scorer(artifact_dir)
     metrics.serve(int(os.environ.get("METRICS_PORT", "9100")))
     consumer = _make_consumer("decision-worker", [TRANSACTIONS])
     producer = make_producer()
-    failures = []
-
-    def mark_done_when_delivered(message):
-        """An input counts as done only after its decision is safely in Kafka."""
-
-        def on_delivery(error, _):
-            if error:
-                failures.append(error)
-            else:
-                consumer.store_offsets(message=message)
-
-        return on_delivery
-
     log.info("Worker started")
     try:
         while True:
-            for message in _good_messages(consumer):
-                result = handle_transaction(scorer, message.value())
-                publish(producer, *result, on_delivery=mark_done_when_delivered(message))
-            producer.poll(0)
-            if failures:
-                # Crash on purpose: the restart replays anything not marked done.
-                raise RuntimeError(f"Could not deliver a decision: {failures[0]}")
+            messages = _good_messages(consumer)
+            if messages:
+                process_transactions(scorer, consumer, producer, messages)
     finally:
-        producer.flush(10)
         consumer.close()
 
 
@@ -239,10 +259,11 @@ def run_labels(as_of_day: float) -> None:
         & (df["label_available_ts"] <= as_of_day * DAY)
     ]
     producer = make_producer()
+    acks = DeliveryAcks()
     for transaction_id, label_ts in zip(arrived["transaction_id"], arrived["label_available_ts"]):
         value = json.dumps({"transaction_id": transaction_id, "label_ts": label_ts}).encode()
-        publish(producer, LABELS, transaction_id, value)
-    producer.flush()
+        publish(producer, LABELS, transaction_id, value, on_delivery=acks.record)
+    acks.wait(producer)
     log.info("Published %s chargebacks that arrived by day %s", f"{len(arrived):,}", as_of_day)
 
 
@@ -253,6 +274,7 @@ def run_producer(n: int, rate: float, skip: int, from_day: float, to_day: float 
         keep &= df["ts"] < to_day * DAY
     df = df[keep].iloc[skip : skip + n]
     producer = make_producer()
+    acks = DeliveryAcks()
     started = time.perf_counter()
     for i, txn in enumerate(df[["transaction_id", *TXN_FIELDS]].to_dict("records")):
         if rate > 0:
@@ -260,8 +282,8 @@ def run_producer(n: int, rate: float, skip: int, from_day: float, to_day: float 
             if wait > 0:
                 time.sleep(wait)
         value = json.dumps({**txn, "produced_at": time.time()}).encode()
-        publish(producer, TRANSACTIONS, txn["card_id"], value)
-    producer.flush()
+        publish(producer, TRANSACTIONS, txn["card_id"], value, on_delivery=acks.record)
+    acks.wait(producer)
     elapsed = time.perf_counter() - started
     log.info("Published %s transactions in %.1fs", f"{len(df):,}", elapsed)
 
@@ -308,6 +330,8 @@ def main() -> None:
     elif args.command == "produce":
         run_producer(args.n, args.rate, args.skip, args.from_day, args.to_day)
     elif args.command == "labels":
+        if args.as_of_day is None:
+            parser.error("labels requires --as-of-day")
         run_labels(args.as_of_day)
     elif args.command == "worker":
         run_worker()

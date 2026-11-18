@@ -16,7 +16,7 @@ services:
     image: apache/kafka:4.0.0
     restart: unless-stopped
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -43,7 +43,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -56,7 +56,7 @@ services:
     image: postgres:17-alpine
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       # Local development only. Nothing here is exposed beyond this machine.
       POSTGRES_USER: fraud
@@ -93,7 +93,7 @@ services:
       # Four API processes share one metrics page through files in this folder.
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     restart: on-failure
     depends_on: &ready
       bootstrap:
@@ -169,7 +169,7 @@ services:
     profiles: ["monitoring"]
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
 
@@ -178,7 +178,7 @@ services:
     profiles: ["monitoring"]
     restart: unless-stopped
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       # Local development only: anyone who can reach this port is an admin.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
@@ -198,7 +198,7 @@ services:
     restart: unless-stopped
     command: ["dagster", "dev", "-m", "frauddetect.orchestration", "-h", "0.0.0.0", "-p", "3000"]
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       FRAUD_HOME: /app
       MLFLOW_TRACKING_URI: sqlite:////mlflow/mlflow.db
@@ -221,7 +221,7 @@ services:
     build: ./flink
     command: jobmanager
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager

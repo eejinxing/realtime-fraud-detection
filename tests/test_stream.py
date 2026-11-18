@@ -1,5 +1,6 @@
 import json
 import threading
+from unittest.mock import Mock, call
 
 import fakeredis
 import numpy as np
@@ -17,6 +18,7 @@ from frauddetect.stream import (
     decision_row,
     handle_transaction,
     label_row,
+    process_transactions,
 )
 
 
@@ -85,6 +87,15 @@ def test_bootstrap_only_loads_once(store):
     assert json.loads(store.client.get("card:c1"))["count"] == 2
 
 
+def test_bootstrap_recovers_a_legacy_loading_marker(store):
+    store.client.set("bootstrap:done", "loading")
+    engine = FeatureEngine()
+    engine.process(txn(1))
+    assert store.bootstrap(engine) is True
+    assert store.client.get("bootstrap:done") == b"done"
+    assert json.loads(store.client.get("card:c1"))["count"] == 1
+
+
 @pytest.fixture
 def trained(trained_run):
     return trained_run[0]
@@ -112,7 +123,17 @@ def test_stream_path_matches_offline_scores(trained, scorer):
 
 
 @pytest.mark.parametrize(
-    "raw", [b"not json", b'{"transaction_id": "t1"}', b"\xff\xfe", b'{"amount": -1}']
+    "raw",
+    [
+        None,
+        b"not json",
+        b'{"transaction_id": "t1"}',
+        b"\xff\xfe",
+        b'{"amount": -1}',
+        json.dumps({**txn(1), "produced_at": "invalid"}).encode(),
+        json.dumps({**txn(1), "ts": float("nan")}).encode(),
+        json.dumps({**txn(1), "amount": float("inf")}).encode(),
+    ],
 )
 def test_bad_messages_go_to_the_dead_letter_topic(scorer, raw):
     topic, key, value = handle_transaction(scorer, raw)
@@ -134,3 +155,37 @@ def test_decision_event_becomes_a_database_row(scorer):
 def test_label_event_becomes_a_database_row():
     value = json.dumps({"transaction_id": "t9", "label_ts": 123.5}).encode()
     assert label_row(value) == ("t9", 123.5)
+
+
+@pytest.mark.parametrize("delivery_failure, pending", [(False, 0), (True, 0), (False, 1)])
+def test_offsets_wait_for_all_output_acks(scorer, delivery_failure, pending):
+    consumer, producer = Mock(), Mock()
+    messages = [Mock(), Mock(), Mock()]
+    for message, partition in zip(messages, [0, 0, 1]):
+        message.topic.return_value = "transactions"
+        message.partition.return_value = partition
+    messages[0].value.return_value = b"bad record"
+    for i, message in enumerate(messages[1:], start=1):
+        message.value.return_value = json.dumps(txn(i, card=f"offset-test-{i}")).encode()
+
+    def flush(_timeout):
+        callbacks = [args.kwargs["on_delivery"] for args in producer.produce.call_args_list]
+        # Later decisions can arrive before an earlier dead letter.
+        callbacks[2](None, None)
+        callbacks[1](None, None)
+        if not pending:
+            callbacks[0]("broker delivery failed" if delivery_failure else None, None)
+        consumer.store_offsets.assert_not_called()
+        return pending
+
+    producer.flush.side_effect = flush
+    if delivery_failure or pending:
+        with pytest.raises(RuntimeError, match="delivery failed|Timed out"):
+            process_transactions(scorer, consumer, producer, messages)
+        consumer.store_offsets.assert_not_called()
+    else:
+        process_transactions(scorer, consumer, producer, messages)
+        assert consumer.store_offsets.call_args_list == [
+            call(message=messages[1]),
+            call(message=messages[2]),
+        ]

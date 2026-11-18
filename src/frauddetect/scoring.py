@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat
 
 from frauddetect.config import Paths
 from frauddetect.decision import decide
@@ -21,11 +21,11 @@ RELOAD_CHECK_SECONDS = 2.0
 
 class Transaction(BaseModel):
     transaction_id: str
-    ts: float
+    ts: FiniteFloat
     card_id: str
     merchant_id: str
     merchant_category: int = Field(ge=0)
-    amount: float = Field(gt=0)
+    amount: FiniteFloat = Field(gt=0)
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     device_id: str

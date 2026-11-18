@@ -28,17 +28,17 @@ PSI_ALERT = 0.25
 
 COHORT_SQL = """
     SELECT day, model_version, decisions, confirmed_fraud, caught
-    FROM cohort_recall WHERE day >= %s ORDER BY day, model_version
+    FROM cohort_recall WHERE day >= %s AND day < %s ORDER BY day, model_version
 """
 LIVE_SQL = """
     SELECT features, score FROM decisions
-    WHERE event_ts >= %s AND event_ts < %s AND features IS NOT NULL
+    WHERE event_ts >= %s AND event_ts < %s AND model_version = %s AND features IS NOT NULL
 """
 
 
-def cohort_recall(connection, since_day: int) -> pd.DataFrame:
+def cohort_recall(connection, since_day: int, until_day: int) -> pd.DataFrame:
     with connection.cursor() as cursor:
-        cursor.execute(COHORT_SQL, (since_day,))
+        cursor.execute(COHORT_SQL, (since_day, until_day))
         columns = ["day", "model_version", "decisions", "confirmed_fraud", "caught"]
         return pd.DataFrame(cursor.fetchall(), columns=columns)
 
@@ -84,15 +84,16 @@ def retrain_trigger(
     if newest is None:
         return None
     today = int(newest // DAY)
-    cohorts = cohort_recall(connection, today - lookback_days)
-    mature = cohorts[cohorts["day"] <= today - maturity_days]
-    alert = recall_alert(mature)
+    cohorts = cohort_recall(connection, today - lookback_days, today - maturity_days + 1)
+    alert = recall_alert(cohorts)
     return {"as_of_day": today, **alert} if alert["alert"] else None
 
 
-def live_psi(connection, reference: dict, from_day: float, to_day: float) -> dict[str, float]:
+def live_psi(
+    connection, reference: dict, from_day: int, to_day: int, version: str
+) -> dict[str, float]:
     with connection.cursor() as cursor:
-        cursor.execute(LIVE_SQL, (from_day * DAY, to_day * DAY))
+        cursor.execute(LIVE_SQL, (from_day * DAY, to_day * DAY, version))
         rows = cursor.fetchall()
     if not rows:
         return {}
@@ -110,8 +111,8 @@ def psi_status(value: float) -> str:
 def build_report(connection, paths: Paths, since_day: int, until_day: int) -> dict:
     version = read_pointer(paths)
     reference = load_meta(paths, version)["reference"]
-    cohorts = cohort_recall(connection, since_day)
-    psi_values = live_psi(connection, reference, since_day, until_day)
+    cohorts = cohort_recall(connection, since_day, until_day)
+    psi_values = live_psi(connection, reference, since_day, until_day, version)
     return {
         "live_model": version,
         "recall": recall_alert(cohorts),
@@ -147,7 +148,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     report = commands.add_parser("report", help="print drift and missed-fraud status")
     report.add_argument("--since-day", type=int, required=True)
-    report.add_argument("--until-day", type=int, default=10_000)
+    report.add_argument("--until-day", type=int, default=10_000, help="exclusive end day")
     report.add_argument("--text", action="store_true", help="a short summary instead of JSON")
     args = parser.parse_args()
 

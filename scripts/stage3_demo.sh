@@ -7,7 +7,7 @@
 #   3. Look at what the monitors say
 #   4. Retrain, and let the gate decide
 #   5. Switch the live model by hand, watch the running services follow, and roll back
-set -uo pipefail
+set -euo pipefail
 
 sql() { docker compose exec -T postgres psql -U fraud -d fraud -c "$1"; }
 sql_value() { docker compose exec -T postgres psql -U fraud -d fraud -At -c "$1"; }
@@ -15,15 +15,20 @@ ops() { docker compose --profile ops run --rm -T ops "$@"; }
 stream() { docker compose run --rm -T producer python -m frauddetect.stream "$@" 2>&1; }
 
 replay() {  # replay FROM_DAY TO_DAY: send that range through Kafka and wait for the decisions
-  local from=$1 to=$2 before sent
+  local from=$1 to=$2 before sent stored
   before=$(sql_value "SELECT count(*) FROM decisions")
   sent=$(stream produce --from-day "$from" --to-day "$to" --n 1000000 --rate 1500 \
          | grep -oE 'Published [0-9,]+' | tr -dc '0-9')
   for _ in $(seq 1 300); do
-    [ "$(sql_value 'SELECT count(*) FROM decisions')" -ge $((before + sent)) ] && break
+    stored=$(( $(sql_value 'SELECT count(*) FROM decisions') - before ))
+    [ "$stored" -ge "$sent" ] && break
     sleep 1
   done
-  echo "days $from to $to: $sent transactions sent, $(( $(sql_value 'SELECT count(*) FROM decisions') - before )) decisions stored"
+  echo "days $from to $to: $sent transactions sent, $stored decisions stored"
+  if [ "$stored" -ne "$sent" ]; then
+    echo "Replay did not store the expected number of decisions" >&2
+    return 1
+  fi
 }
 
 step() { echo; echo "=== $* ==="; }
@@ -35,8 +40,7 @@ docker compose --profile ops build ops 2>&1 | tail -1
 step "1. Train v1 (the model in production before merchant history existed)"
 ops python -m frauddetect.train 2>&1 | grep -E "labels already|low_and_slow|test_pr_auc|test_recall"
 
-docker compose up -d --build api worker sink 2>&1 | tail -1
-sleep 30
+docker compose up --build --wait api worker sink
 step "1. Replay days 100 to 112 under v1"
 replay 100 112
 
@@ -62,7 +66,7 @@ echo "API answers with:"
 docker compose exec -T api python - <<'PY'
 import json, urllib.request
 # Inside the day just replayed, so it does not move the system's idea of "today".
-body = {"transaction_id": "demo-1", "ts": 112.9 * 86400.0, "card_id": "c1", "merchant_id": "m1",
+body = {"transaction_id": "demo-1", "ts": 112.9 * 86400.0, "card_id": "demo-card", "merchant_id": "m1",
         "merchant_category": 1, "amount": 25.0, "lat": 40.0, "lon": -75.0, "device_id": "d1",
         "channel": "pos"}
 request = urllib.request.Request("http://localhost:8000/v1/score", json.dumps(body).encode(),

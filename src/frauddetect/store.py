@@ -6,7 +6,7 @@ import os
 import pickle
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,13 @@ SLOW_STORE_MS = float(os.environ.get("FRAUD_SLOW_STORE_MS", "20"))
 MAX_RETRIES = 20
 BOOTSTRAP_KEY = "bootstrap:done"
 BOOTSTRAP_BATCH = 500
+
+
+def _merchant_snapshot_items(snapshots: np.ndarray, from_day: int) -> Iterator[tuple[str, str]]:
+    for day in range(from_day, len(snapshots)):
+        for merchant in np.flatnonzero(snapshots[day].sum(axis=1)):
+            transactions, frauds = snapshots[day, merchant]
+            yield snapshot_key(day, f"m{merchant}"), f"{int(transactions)},{int(frauds)}"
 
 
 class InMemoryStore:
@@ -109,13 +116,12 @@ class RedisFeatureStore:
         """
         written = 0
         with self.client.pipeline(transaction=False) as pipe:
-            for day in range(from_day, len(snapshots)):
-                for merchant in np.flatnonzero(snapshots[day].sum(axis=1)):
-                    transactions, frauds = snapshots[day, merchant]
-                    pipe.set(snapshot_key(day, f"m{merchant}"), f"{int(transactions)},{int(frauds)}")
-                    written += 1
-                    if written % BOOTSTRAP_BATCH == 0:
-                        pipe.execute()
+            for written, (key, value) in enumerate(
+                _merchant_snapshot_items(snapshots, from_day), start=1
+            ):
+                pipe.set(key, value)
+                if written % BOOTSTRAP_BATCH == 0:
+                    pipe.execute()
             pipe.execute()
         return written
 
@@ -123,17 +129,26 @@ class RedisFeatureStore:
         self, engine: FeatureEngine, snapshots: np.ndarray | None = None, from_day: int = 0
     ) -> bool:
         """Load history once. Returns False if the store was already loaded."""
-        if not self.client.set(BOOTSTRAP_KEY, "loading", nx=True):
-            return False
-        with self.client.pipeline(transaction=False) as pipe:
-            for i, (card_id, state) in enumerate(engine.cards.items(), start=1):
+        with self.client.pipeline() as pipe:
+            pipe.watch(BOOTSTRAP_KEY)
+            if pipe.get(BOOTSTRAP_KEY) in (b"done", "done"):
+                return False
+
+            # The old bootstrap left a "loading" marker if it was interrupted.
+            # Publish the initial data and the completion marker together.
+            pipe.multi()
+            for card_id, state in engine.cards.items():
                 pipe.set(f"card:{card_id}", json.dumps(state.to_dict()))
-                if i % BOOTSTRAP_BATCH == 0:
-                    pipe.execute()
-            pipe.execute()
-        if snapshots is not None:
-            self.load_merchant_snapshots(snapshots, from_day)
-        self.client.set(BOOTSTRAP_KEY, "done")
+            if snapshots is not None:
+                for key, value in _merchant_snapshot_items(snapshots, from_day):
+                    pipe.set(key, value)
+            pipe.set(BOOTSTRAP_KEY, "done")
+            try:
+                pipe.execute()
+            except redis.WatchError:
+                if self.client.get(BOOTSTRAP_KEY) in (b"done", "done"):
+                    return False
+                raise
         return True
 
 

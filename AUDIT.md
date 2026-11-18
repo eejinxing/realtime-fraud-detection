@@ -1,293 +1,88 @@
-# 可信度审计
+# Model and pipeline audit
 
-检查这个项目的结果能不能信：有没有偷看答案、有没有过拟合或欠拟合、精确率和召回率到底是多少、文档里有没有说错或编造的地方。
+These results are from synthetic transactions. The default seed was used while developing the simulator, features, and policy. Seeds 11–14 and 21–24 were used for separate checks.
 
-所有数字都来自实际运行的输出，数据是**模拟的**。命令在最后。
+## Leakage checks
 
-## 结论
+- Changing later transactions left earlier features unchanged. Changing chargebacks that had not arrived left the merchant snapshots unchanged.
+- The strongest individual feature on the test period was `is_new_merchant`, with ROC-AUC of 0.912. The simulator assigns random merchants to some fraud patterns, which makes this feature unusually informative.
+- Three runs with shuffled training labels scored 0.0034, 0.0182, and 0.0121 average precision. The test fraud rate was 0.0036, and the trained model scored 0.756. The higher shuffled scores were observed in a small positive class.
+- The guards caught two deliberate changes to the merchant history calculation. One ignored arrival dates and the other included chargebacks from the transaction's day. Fraud labels and pattern names are excluded from model features and API input fields.
 
-| 问题 | 结论 | 要注意 |
-|---|---|---|
-| **偷看答案（数据泄漏）** | 代码里没发现泄漏，4 个永久测试守着，并且测试本身用故意植入的泄漏验证过 | **模拟器是我写的，我知道答案**，所以问题的难度和"漏掉哪一类"都是我设计的（见下文） |
-| **过拟合** | 没有明显过拟合 | 阈值是在验证期上选的，对未来**偏乐观**：复核层在验证期省 $459，在测试期只省 $27 |
-| **欠拟合** | 没有 | 深度只有 2 的简单模型和调参后的模型一样好，**调参几乎没带来价值** |
-| **精确率** | 拒绝：92.0%；复核：**0.9%**；总体 33.1% | 在 5 次不同的训练里，总体精确率在 22%–33% 之间波动 |
-| **召回率（不要漏）** | 74.9%，**漏掉的 100% 都是同一类新型欺诈** | 已知的两类一笔没漏；按金额只漏了 9% |
-| **说错或编造** | 找到 10 处说得比证据更肯定的地方，已改 | 见下文 |
+The same validation period was used for early stopping, tuning and threshold selection. Test results informed project development, including the choice to add merchant history and the original 30-fraud promotion minimum. Those decisions limit how far the default-seed results generalize.
 
-## 一、有没有偷看答案
+## Fit and decision quality
 
-### 做了什么
+| Window | Rows | Frauds | PR-AUC | ROC-AUC |
+| --- | ---: | ---: | ---: | ---: |
+| Training | 212,231 | 997 | 0.998 | 1.000 |
+| Validation | 45,521 | 204 | 0.956 | 1.000 |
+| Test | 60,479 | 219 | 0.756 | 0.953 |
+| Test, excluding `low_and_slow` | 60,424 | 164 | 0.997 | |
 
-| 检查 | 方法 | 结果 |
-|---|---|---|
-| 没到的拒付会不会影响特征 | 把 105 笔还没到的拒付改成"不是欺诈"，再把之后所有标签改成"欺诈"，看当天的商户历史动不动 | **不变** |
-| 后来的交易会不会影响更早的特征 | 把第 60 天之后的金额、商户、标签全部打乱，看之前的特征动不动 | **逐位相同** |
-| 有没有单个特征直接泄露答案 | 在测试期逐个算单特征 AUC，超过 0.95 算可疑 | 最强的是 `is_new_merchant`，**0.912**，没超线 |
-| 答案打乱后还有没有成绩 | 把训练标签打乱再训练，用真实答案测试 | 0.0034、0.0182、0.0121，基准是 0.0036；真实模型 0.756，是最好那次的 **42 倍** |
-| 答案列会不会进模型或接口 | 检查特征名、输入字段、API 模型里有没有 `is_fraud`、`fraud_pattern`、`label_available_ts` | **没有** |
+The test gap almost disappears when the new pattern is removed. On this dataset, a depth-2 XGBoost model scored 0.934 on validation and 0.761 on test. The tuned model scored 0.956 and 0.756, respectively. Logistic regression scored 0.848 and 0.645.
 
-**测试的测试**：一个测试只有在真有泄漏时能报错才有意义。我故意植入了两种泄漏：忽略拒付到达的时间、统计当天的欺诈。**两种都被抓到了**；正确的规则不触发。
+| Decision | Total | Fraud | Legitimate |
+| --- | ---: | ---: | ---: |
+| Decline | 175 | 161 | 14 |
+| Review | 320 | 3 | 317 |
+| Approve | 59,984 | 55 | 59,929 |
 
-这些检查现在是永久测试：`tests/test_leakage.py`。
+The review tier saved $459 over a decline-only policy on validation and about $27 on test. All 55 missed frauds were `low_and_slow`. Their total amount was $2,518 out of $27,332 in simulated fraud. Raising recall to 90% using the scores reduced the best available precision to about 2%.
 
-答案打乱的第二次结果 0.0182 是基准的 5 倍，我认为是欺诈太少时的运气，没有进一步验证。
+The same setup produced 0.751 test PR-AUC and 27.8% precision on Windows, and 0.756 test PR-AUC and 33.1% precision in Docker. Both runs had 74.9% recall. The cause of the platform difference was not established.
 
-### 我提前知道答案的地方
+## Results across seeds
 
-查不出来的泄漏，才是最危险的。下面这些是**我自己知道**的：
-
-1. **模拟器是我写的。** 特征（连续消费速度、不可能的移动、新设备、新商户、商户欺诈率）是照着我知道的欺诈模式设计的。已知两类欺诈 100% 抓到、去掉新型欺诈后测试期 PR-AUC 是 0.997，说明**这是一个很容易的、我自己出的题**，不代表真实世界的水平。单个特征 `is_new_merchant` 就有 0.912 的 AUC，是因为模拟器让欺诈用随机商户。
-2. **商户风险特征是因为我知道 `low_and_slow` 落在被攻破的商户上才加的。**
-3. **晋升门槛里的 30 是我看过默认种子的未来结果之后才定的。** 这是真正意义上的"偷看"：它在新种子上从没被验证。（后来窗口设计改了，见第七节。30 这个数字没变，只是现在有了"教科书经验值"这个说法。）
-4. **默认种子（42）贯穿整个开发过程**，所有主要数字都来自一份代码就是照着它开发的数据。下面的 4 个全新种子才是"开发时没见过"的。
-
-模型的权重和阈值**没有**用测试数据训练或选择：调参、早停、阈值都只用验证期。但我在开发中多次看过测试期的结果。
-
-## 二、过拟合和欠拟合
-
-数据：212,231 行训练，45,521 行验证，60,479 行测试。
-
-| 阶段 | 欺诈数 | PR-AUC | ROC-AUC |
-|---|---|---|---|
-| 训练 | 997 | 0.998 | 1.000 |
-| 验证 | 204 | 0.956 | 1.000 |
-| 测试 | 219 | **0.756** | 0.953 |
-| 测试，去掉新型欺诈 | 164 | **0.997** | |
-
-- 训练比验证高 0.042：**轻微**，不算过拟合。
-- 验证比测试高 0.200：**这不是过拟合**。把新型欺诈 `low_and_slow` 去掉后，测试期是 0.997，和训练一样好。落差**完全**来自测试期出现的新欺诈。
-- 学习曲线（树的数量）：
-
-| 树 | 训练 | 验证 | 测试 |
-|---|---|---|---|
-| 5 | 0.802 | 0.930 | 0.736 |
-| 10 | 0.951 | 0.934 | 0.744 |
-| 25 | 0.990 | 0.942 | 0.752 |
-| 50 | 0.994 | 0.945 | 0.751 |
-| **106（早停选的）** | 0.998 | 0.948 | 0.756 |
-| 200 | 0.999 | 0.947 | 0.757 |
-| 400 | 1.000 | 0.949 | 0.758 |
-
-训练升到 1.0，验证和测试走平，**没有下降**。5 棵树时训练只有 0.802（欠拟合），25 棵之后就够了。
-
-### 模型是不是太简单，或者调参有没有用
-
-| 模型 | 验证 | 测试 |
-|---|---|---|
-| 抛硬币（基准） | 0.004 | 0.004 |
-| 逻辑回归 | 0.848 | 0.645 |
-| 增强树，深度 2（很简单） | 0.934 | **0.761** |
-| 线上模型（调参后） | **0.956** | 0.756 |
-
-- 没有欠拟合：深度 2 的简单模型和线上模型差不多。逻辑回归明显弱，说明需要非线性。
-- **调参几乎没带来价值**：验证上多 0.022，测试上反而少 0.005。这份模拟数据太容易，"贝叶斯调参"在这里没有意义。
-
-### 阈值对未来偏乐观
-
-阈值是在验证期选的。检查复核这一层在两个时期的价值：
-
-| 时期 | 有复核的成本 | 只拒绝的成本 | 复核层 |
-|---|---|---|---|
-| 验证期 | $1,621 | $2,080 | 省 **$459** |
-| 测试期 | $3,828 | $3,854 | 只省 **$27** |
-
-这是一种轻微的"阈值过拟合"：验证期上看起来有用的复核层，到了未来几乎没用。
-
-## 三、精确率和召回率
-
-测试期（20 天，60,479 笔，219 笔欺诈），线上模型 v1：
-
-|  | 欺诈 | 正常 |
-|---|---|---|
-| 被标记 | 164 | 331 |
-| 放过 | **55** | 59,929 |
-
-- **精确率 33.1%**：标记的里面三分之一是真欺诈。
-- **召回率 74.9%**，每天标记约 25 笔。
-- 漏掉的欺诈金额 $2,518，占欺诈总额 $27,332 的 **9%**（按笔数漏 25%，按金额只漏 9%，因为漏掉的那类金额很小）。
-
-### 各层的精确率
-
-| 决策 | 数量 | 其中欺诈 | 精确率 |
-|---|---|---|---|
-| 拒绝 | 175 | 161 | **92.0%**（验证时定的目标是 90%） |
-| 复核 | 320 | 3 | **0.9%** |
-
-拒绝层很准。**复核层基本是噪音**：320 笔里只有 3 笔欺诈。
-
-### 漏掉了什么（不要漏）
-
-| 欺诈类型 | 数量 | 抓到 |
-|---|---|---|
-| account_takeover | 63 | 100% |
-| card_testing | 101 | 100% |
-| **low_and_slow（新）** | 55 | **0%** |
-
-**漏掉的 55 笔，100% 是 `low_and_slow`。** 已知的两类一笔没漏。想把召回率提到 90%，最好的精确率只有 **2.0%**，因为新型欺诈在模型眼里和正常消费没有区别。
-
-| 想抓到的比例 | 能做到的最高精确率 |
-|---|---|
-| 50% | 100% |
-| 70% | 98.1% |
-| 90% | 2.0% |
-
-### 召回率和精确率不是固定的
-
-默认种子下，Windows 训练的 v1 精确率是 27.8%，Docker 训练的是 33.1%（库版本完全相同，原因不明）。下面 4 个新种子里精确率在 22%–26%。**只报一个数字是误导**。
-
-## 四、在没见过的数据上重复（4 个新种子）
-
-用不同的随机种子重新模拟、重新训练、重新重训。每个种子里：
-
-| 种子 | v1 PR-AUC | 随机切分 PR-AUC | 召回率 | 精确率 | 新欺诈抓到 |
-|---|---|---|---|---|---|
+| Seed | Chronological PR-AUC | Random PR-AUC | Recall | Precision | New pattern recall |
+| --- | ---: | ---: | ---: | ---: | ---: |
 | 11 | 0.717 | 0.957 | 69.7% | 25.5% | 1.5% |
 | 12 | 0.775 | 0.975 | 76.4% | 26.0% | 2.1% |
 | 13 | 0.678 | 0.959 | 66.9% | 22.1% | 1.6% |
 | 14 | 0.787 | 0.971 | 78.8% | 22.6% | 1.9% |
 
-- **按时间切分比随机切分低很多，在每个种子里都成立**（0.68–0.79 对 0.96–0.98）。这是可靠的结论。
-- 新型欺诈在每个种子里都基本抓不到（1.5%–2.1%）。
-- 开发用的默认种子上 v1 是 0.756，在新种子上是 **0.68–0.79**，范围更宽，数字没有被特别高估。
+The original retraining gate evaluated the most recent seven days, when many chargebacks were still pending. Only 8–13 frauds in each holdout were confirmed, below the gate's 30-case minimum. The gate retained the incumbent four times. Two challengers were cheaper in the following days by 8–12%, and two were more expensive by 13–16%.
 
-### 重训和晋升门槛（第一版窗口设计；改过之后的结果在第七节）
+## Chargeback maturity and promotion
 
-| 种子 | 留出窗口欺诈数 | 之后 v1 成本 | 之后新模型成本 | 新模型真的更好吗 | 门槛 | 门槛对吗 |
-|---|---|---|---|---|---|---|
-| 11 | 11 | $1,389 | $1,222 | **是**（−12%） | 保留 v1 | 错 |
-| 12 | 8 | $1,520 | $1,395 | **是**（−8%） | 保留 v1 | 错 |
-| 13 | 8 | $2,647 | $3,081 | 否（+16%） | 保留 v1 | 对 |
-| 14 | 13 | $2,457 | $2,778 | 否（+13%） | 保留 v1 | 对 |
+The revised gate estimates the 90th-percentile chargeback delay from older transactions and moves both holdout and validation windows back. Each window spans one week. The previous design used five validation days and seven holdout days.
 
-加上默认种子（v1 $1,268，新模型 $3,125，+146%），新模型的结果**从便宜 12% 到贵 146%**，不是"系统性更差"，而是**不稳定**。
+| Seed | Confirmed fraud, old holdout | Confirmed fraud, revised holdout | Revised gate | Later v1 cost | Later old challenger cost | Later revised challenger cost |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 21 | 15 | 109 | Keep v1 | $1,500 | $1,456 | $1,721 |
+| 22 | 14 | 103 | Keep v1 | $1,510 | $1,499 | $1,602 |
+| 23 | 11 | 104 | Keep v1 | $1,254 | $1,351 | $1,378 |
+| 24 | 16 | 111 | Promote | $1,822 | $1,557 | $1,817 |
 
-**门槛 4 次都直接拒绝**，因为留出窗口只有 8–13 个已确认欺诈，凑不够 30 个，根本没有进入比较。按这个数据量，它挡得住坏模型，也挡得住好模型，对错各一半，等于"永远保留现有模型"。**那个 30 是看过默认种子的结果之后才定的，从没在没见过的数据上验证过，现在在新数据上的表现是：基本不起作用。**
+The revised gate reached a comparison in all four runs. Its choices agreed with the following eight days of simulated cost four times. Keeping v1 would have agreed three times. The one promotion saved $5 over that future period, so this experiment provides limited evidence for promoting a challenger. It used four seeds with one comparison per seed.
 
-修法（比如把留出窗口拉长到凑够欺诈数）需要在**没见过的新种子**上验证。11–14 已经看过了，不能再用。
+The revised challengers trained on older transactions and cost more than the old challengers on all four seeds. Refitting with more recent data after the gate would put a different model into service and needs a separate evaluation.
 
-## 五、说错或编造的地方
+## Earlier performance measurements
 
-逐条对照了文档里的因果判断和数字，下面是说得比证据更肯定的地方，**已改**：
+These results came from a single laptop running WSL before the worker's delivery acknowledgement fix. The benchmark warmed Kafka with 20,000 events before collecting timings.
 
-| 原来的说法 | 实际情况 | 改成 |
-|---|---|---|
-| "XGBoost 在不同平台上结果略有差异，所以两个环境数字不同" | **库版本完全相同**（xgboost 3.4.1 等），这个解释没有依据 | "原因不明"；只陈述事实：环境之间不同，同一环境重跑逐位相同 |
-| 慢请求"重试次数全是 1" | 我只看了 14 条，另一次日志里见过 `attempts 2`，没做完整统计 | "基本排除，但没有完整统计" |
-| "Airflow 的依赖会和 XGBoost、pandas 冲突" | **我从没试过 Airflow**，是预判 | 标注"没有验证" |
-| "Evidently 接口变化大、依赖重" | **我从没试过 Evidently**，是印象 | 标注"没有验证" |
-| "约 8 秒接管" | 是我从最长延迟 8.1 秒推出来的，没单独测过 | 改成实测的"最长延迟 8.1 秒"，注明接管时间没测 |
-| "同步 API 100 请求/秒 P99 10–19 ms" | 其实**各只测了一次**，而且 10 ms 那次是不带 Kafka 发布的 | 改成"19 ms，只测了一次" |
-| "所有输入分布都没变" | 我只监控了 7 个输入加得分 | "我监控的 7 个输入和得分" |
-| "DeepSeek 的 API 按 token 收费" | 多数来源这么说，但有一个来源说有免费额度，我没核实到官方页面 | 加了限定 |
-| "冒烟测试说明延迟和负载强相关" | 只有两个数据点 | "可能和负载有关，不足以下结论" |
-| "重训后新模型反而更差" | 只在默认种子成立，4 个新种子里 2 好 2 差 | "不稳定"，并列出全部数据 |
+| Path | Observed result |
+| --- | --- |
+| Kafka replay, about 56,000 transactions | All expected decisions reached PostgreSQL, with a maximum offline score gap of 2.38e-07 |
+| One worker killed during replay | All expected decisions arrived. The maximum affected-message latency was 8.1 seconds |
+| Kafka at 500 events/s | P50 about 50 ms and P99 500–790 ms across two runs |
+| Kafka at 1,000 events/s | Backlog grew and P50 reached about 2 seconds across two runs |
+| API at 100 requests/s | P99 19 ms with Kafka publishing in one run |
+| API at 200 requests/s | P99 varied from 28 to 500 ms |
 
-**没有逐条验证的**：我在对话里说过 Flink "在大厂风控里很常见"，以及 PSI "是风控里实际在用的指标"。这两句来自我的一般性知识，不是这个项目里查证过的，文档里的 PSI 那句我保留了，但你不应该把它当成我核实过的事实。
+The slow API requests spent time on different Redis round trips. Switching to uvloop reduced median latency, while the cause of the tail latency remained unresolved.
 
-## 六、这份审计没有证明什么
+## Reproduce the checks
 
-- **全部是模拟数据。** 真实银行数据里的泄漏方式（比如时间戳精度、特征在事后才被回填）这里没有，也测不到。
-- 种子只有 4 个，每个种子只重复一次，调参只用了 3 次试验（默认种子是 10 次）。
-- 答案打乱的检验只做了 3 次。
-- 泄漏测试覆盖了特征和商户历史，**没有**覆盖线上服务里"特征在请求时才计算"这条路径是否可能看到未来数据（它只能看到 Redis 里已有的状态，设计上看不到，但没有专门的测试）。
-- 验证期同时用于早停、调参和定阈值，所以验证期上的数字偏乐观，这是设计如此，测试期没有被用来选择任何东西。
-
-## 七、晋升门槛的修改
-
-### 病根（修改前就已确认）
-
-第四节发现门槛在 4 个种子上全部直接拒绝。原因不是"30 这个数字太大"，而是**窗口设计错了**：留出窗口取的是"最近 7 天"，而拒付平均要 7 天才到，所以这 7 天里大部分欺诈还没被标记。`tests/test_mlops.py` 里有一个测试把这一点量化了：旧设计的留出窗口里不到 40% 的欺诈已确认，新设计超过 80%。
-
-### 修改（按原理定的，没有看结果调）
-
-1. 留出窗口**只取已成熟的日期**：结束在"90% 的拒付已经到达"的那一天之前。这个天数**从数据里测出来**（`label_maturity_days`，只用较老的一半历史，因为较新的欺诈还在等拒付，会让延迟看起来比实际短），不写死。测试用模拟器已知的真实延迟校验过这个测量（误差小于 1.5 天）。
-2. 验证窗口和留出窗口各取一周（之前验证窗口是 5 天，只有 43 个欺诈，v2 在上面训练得不稳）。
-3. 30 个欺诈的下限、成本至少降 5%、90% 的重抽样更便宜、PR-AUC 不降超过 0.02，**都不动**。现在 30 是教科书里"比例估计才勉强稳定"的经验值，不再是我看过结果后定的。
-
-代价：挑战者和留出窗口都不包含最近约 29 天（成熟期 + 两周），所以**门槛没法判断模型对最新欺诈的表现**。它只能回答"换了新模型会不会在已经能确认的数据上变差"。
-
-### 验证方案（在运行之前写下）
-
-在**从没用过的种子 21、22、23、24** 上，对同一份模拟数据同时跑旧设计和新设计，**只跑一次**。
-
-成功标准（跑之前定的，不改）：
-
-1. 新设计在 4 个种子里**每次都能真正比较**（留出窗口至少 30 个已确认欺诈）。旧设计在种子 11–14 上是 0 次。
-2. 在能比较的种子里，门槛的决定和"之后的真实成本"一致的次数**至少 3/4**。"一致"的意思：挑战者之后真的更便宜，则应该晋升；否则应该拒绝。
-3. 要有价值，必须**比"永远保留现有模型"好**：这个基线的正确率等于挑战者真的更差的次数。
-4. 只有 4 个种子，**证明不了**门槛好。达不到标准就如实报告，**不在这 4 个种子上再调参数**。
-
-### 结果（种子 21–24，只跑了一次）
-
-| 种子 | v1 的 PR-AUC | 旧设计：留出欺诈数，决定 | 新设计：留出欺诈数，决定 | 之后成本：v1 | 旧设计的挑战者 | 新设计的挑战者 |
-|---|---|---|---|---|---|---|
-| 21 | 0.816 | 15，保留 | **109**，保留（挑战者成本高 35%） | $1,500 | $1,456 | $1,721 |
-| 22 | 0.779 | 14，保留 | **103**，保留（高 6%） | $1,510 | $1,499 | $1,602 |
-| 23 | 0.806 | 11，保留 | **104**，保留（低 5.9%，但只在 75% 的重抽样里成立） | $1,254 | $1,351 | $1,378 |
-| 24 | 0.760 | 16，保留 | **111**，**晋升**（低 23.9%，100% 的重抽样） | $1,822 | $1,557 | $1,817 |
-
-这 4 个种子里 v1 的召回率是 74%–81%，精确率 28%–34%，和前面各节的范围一致。
-
-### 对照写下的标准
-
-| 标准 | 结果 |
-|---|---|
-| 1. 新设计 4 个种子每次都能真正比较 | **达到**：103–111 个已确认欺诈，旧设计是 11–16 个 |
-| 2. 决定与真实成本一致至少 3/4 | **达到**：新设计 4/4，旧设计 1/4 |
-| 3. 比"永远保留现有模型"好 | **字面达到，实质没有** |
-| 4. 不在这 4 个种子上再调参数 | 没有调 |
-
-**第 3 条的真实情况：** 新设计的挑战者之后真的更差的有 3 次（种子 21、22、23），所以"永远保留"本身就对 3/4。新门槛多对的那 1 次是种子 24：它晋升的模型之后只比 v1 便宜 **$5（0.3%）**，基本是平手。**所以我不能声称这个门槛比"永远保留"更有价值。** 它做到的是：能真正比较了（标准 1），而且留出窗口上判断的方向和之后的真实方向一致的有 3/4（种子 23 是留出窗口上略好、之后更差，被"90% 的重抽样"这一条挡住了）。
-
-### 没预料到的发现
-
-**旧设计训练出的模型更好，只是它没法证明。** 4 个种子上，之后的平均成本：
-
-| | 平均成本 |
-|---|---|
-| v1（线上现有） | $1,522 |
-| 旧设计的挑战者（用较新的数据训练） | $1,466（比 v1 低 3.7%） |
-| 新设计的挑战者（训练数据停在约 29 天前） | $1,630（比 v1 高 7.1%） |
-
-旧设计的挑战者在 4 个种子上**都比**新设计的便宜。新设计为了让门槛能判断，把留出窗口挪到已成熟的日期，训练数据也只能停在那之前，**用不上最近的数据**，模型反而变差了。这是标签延迟带来的真实矛盾：能可靠地判断的数据比较旧，对最新情况有用的数据又还没被确认。
-
-**没有修**的办法：用成熟的窗口来判断，通过之后再用**全部数据**重新训练一次再上线。这是常见做法，但上线的模型和被判断的模型就不是同一个了，而且需要在**没见过的新种子**上重新验证（21–24 已经看过了）。
-
-### 这一节没有证明什么
-
-- 只有 4 个种子，每个种子只有一对决定，样本太小，不能说门槛"可靠"。
-- "之后的真实成本"只用了第 112 天之后的 8 天，里面大约 100 个欺诈，本身也有噪声。种子 24 的 $5 差异就在噪声之内。
-- 门槛对**最新**的欺诈仍然没有判断力：它只看已成熟的日期。
-
-## 运行方式
-
-永久的防泄漏测试（包含在全部测试里）：
-
-## 运行方式
-
-永久的防泄漏测试（包含在全部测试里）：
+After installing `.[train,ops,dev]`, train the baseline with `python -m frauddetect.train` or the Compose command in the [README](README.md). Run these commands from the repository root.
 
 ```bash
-.venv\Scripts\python.exe -m pytest tests/test_leakage.py
+python -m pytest tests/test_leakage.py
+python -m frauddetect.audit leakage
+python -m frauddetect.audit fit
+python -m frauddetect.audit errors
+python -m frauddetect.audit seeds --seeds 21 22 23 24
 ```
 
-在真实规模数据上的审计，需要先训练一个模型（`docker compose --profile ops run --rm ops`）：
-
-```bash
-.venv\Scripts\python.exe -m frauddetect.audit leakage
-```
-
-```bash
-.venv\Scripts\python.exe -m frauddetect.audit fit
-```
-
-```bash
-.venv\Scripts\python.exe -m frauddetect.audit errors
-```
-
-在没见过的数据上重复（约 10 分钟，种子请换成没用过的）：
-
-```bash
-.venv\Scripts\python.exe -m frauddetect.audit seeds --seeds 21 22 23 24
-```
+Use new seeds for any follow-up comparison that changes the training windows or promotion criteria.

@@ -12,7 +12,7 @@ set -euo pipefail
 k6_summary() { grep -E "http_req_duration|http_reqs|http_req_failed|dropped" || true; }
 
 docker compose --profile '*' down -v --remove-orphans 2>&1 | tail -1
-docker compose up -d api worker sink 2>&1 | tail -1
+docker compose up -d --build api worker sink 2>&1 | tail -1
 sleep 30
 
 echo; echo "=== Warm-up, 20,000 events, not a measurement ==="
