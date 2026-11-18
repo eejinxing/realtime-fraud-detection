@@ -1,5 +1,6 @@
 import json
-import threading
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import Mock, call
 
 import fakeredis
@@ -66,15 +67,15 @@ def test_redelivered_transaction_is_not_counted_twice(store):
 
 
 def test_concurrent_updates_to_one_card_are_not_lost(store):
+    start = Barrier(4)
+
     def send(offset):
+        start.wait()
         for i in range(offset, offset + 25):
             store.process(txn(i, ts=1000.0))
 
-    threads = [threading.Thread(target=send, args=(n * 25,)) for n in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(send, range(0, 100, 25)))
     assert json.loads(store.client.get("card:c1"))["count"] == 100
 
 

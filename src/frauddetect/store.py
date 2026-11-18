@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -91,7 +92,8 @@ class RedisFeatureStore:
                     self._log_if_slow(started, attempt, phases)
                     return features
                 except redis.WatchError:
-                    continue
+                    # Spread competing writers out before they watch the same card again.
+                    time.sleep(random.uniform(0.001, min(0.002 * attempt, 0.025)))
         raise RuntimeError(f"Too much contention on {card_key}")
 
     @staticmethod
